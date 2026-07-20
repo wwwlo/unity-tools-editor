@@ -1,0 +1,145 @@
+// PhysicsObjectPainter.cs
+// Assets/Editor
+using System.Collections.Generic;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public class PhysicsObjectPainter : EditorWindow
+{
+    [MenuItem("ObjectDistributor/Physics Object Painter")]
+    static void Open() => GetWindow<PhysicsObjectPainter>("PhysPainter");
+
+    float simulationTime = 10f;
+    readonly List<Transform> roots = new();
+
+    void OnGUI()
+    {
+        GUILayout.Label("LOD-Group Prefabs Selected", EditorStyles.boldLabel);
+
+        if (GUILayout.Button("Refresh Selection") || Event.current.type == EventType.Layout)
+            RefreshRoots();
+
+        foreach (var t in roots)
+            EditorGUILayout.ObjectField(t.name, t, typeof(Transform), true);
+
+        GUILayout.Space(10);
+        simulationTime = EditorGUILayout.FloatField("Simulation Time (s)", simulationTime);
+
+        GUI.enabled = roots.Count > 0;
+        if (GUILayout.Button("Simulate", GUILayout.Height(30)))
+            SimulateSelected();
+        GUI.enabled = true;
+    }
+
+    void RefreshRoots()
+    {
+        roots.Clear();
+        foreach (GameObject go in Selection.gameObjects)
+        {
+            if (go.GetComponentInParent<LODGroup>() == null) continue;
+            Transform root = go.transform.root;
+            if (!roots.Contains(root))
+                roots.Add(root);
+        }
+    }
+
+    void SimulateSelected()
+    {
+        // 1. Сбор MeshCollider'ов
+        var meshCols = new List<MeshCollider>();
+        foreach (var root in roots)
+            meshCols.AddRange(root.GetComponentsInChildren<MeshCollider>(true));
+
+        if (meshCols.Count == 0)
+        {
+            Debug.LogWarning("No MeshColliders found.");
+            return;
+        }
+
+        // 2. Convex ON
+        foreach (var mc in meshCols)
+        {
+            if (!mc.convex)
+            {
+                mc.convex = true;
+                EditorUtility.SetDirty(mc);
+            }
+        }
+
+        // 3. Добавление временных Rigidbody
+        var createdRBs = new List<Rigidbody>();
+        foreach (var mc in meshCols)
+        {
+            if (mc.GetComponent<Rigidbody>() == null)
+            {
+                var rb = mc.gameObject.AddComponent<Rigidbody>();
+                createdRBs.Add(rb);
+            }
+        }
+
+        // 4. Снимаем снапшоты:
+        //   а) исходное положение/вращение самого корня префаба
+        //   б) исходное положение/вращение первого Renderer'а в LOD0
+        var snapshots = new List<(Transform root, Vector3 rootPos, Quaternion rootRot,
+                                  Transform lod0Renderer, Vector3 lod0Pos, Quaternion lod0Rot)>();
+
+        foreach (var root in roots)
+        {
+            var lodGroup = root.GetComponent<LODGroup>();
+            if (lodGroup == null) continue;
+
+            LOD[] lods = lodGroup.GetLODs();
+            if (lods.Length == 0 || lods[0].renderers.Length == 0) continue;
+
+            Transform lod0Renderer = lods[0].renderers[0].transform;
+            snapshots.Add((root,
+                           root.position,
+                           root.rotation,
+                           lod0Renderer,
+                           lod0Renderer.position,
+                           lod0Renderer.rotation));
+        }
+
+        // 5. Запуск симуляции
+        SimulationMode previousMode = Physics.simulationMode;
+        Physics.simulationMode = SimulationMode.Script;
+        float dt = Time.fixedDeltaTime;
+        float elapsed = 0;
+        while (elapsed < simulationTime)
+        {
+            Physics.Simulate(dt);
+            elapsed += dt;
+        }
+        Physics.simulationMode = previousMode;
+
+        // 6. Применяем результат к корню префаба
+        foreach (var snap in snapshots)
+        {
+            Vector3 deltaPos = snap.lod0Renderer.position - snap.lod0Pos;
+            Quaternion deltaRot = snap.lod0Renderer.rotation * Quaternion.Inverse(snap.lod0Rot);
+
+            snap.root.position = snap.rootPos + deltaPos;
+            snap.root.rotation = deltaRot * snap.rootRot;
+
+            // 7. Возвращаем LOD0 renderer в исходное место
+            snap.lod0Renderer.localPosition = Vector3.zero;
+			snap.lod0Renderer.localRotation = Quaternion.identity;
+        }
+
+        // 8. Удаляем временные Rigidbody
+        foreach (var rb in createdRBs)
+            DestroyImmediate(rb);
+
+        // 9. Сохраняем изменения
+        EditorSceneManager.MarkSceneDirty(UnityEngine.SceneManagement.SceneManager.GetActiveScene());
+        Debug.Log("Simulation finished. Prefab pose applied, LOD0 reset.");
+		
+		// 10. Вернуть convex = false
+		foreach (var mc in meshCols)
+		{
+			mc.convex = false;
+			EditorUtility.SetDirty(mc);
+		}
+    }
+}
